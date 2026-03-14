@@ -77,15 +77,17 @@ def main():
 
     scan_files = []
     try:
-        for entry in os.listdir(WATCH_FOLDER):
-            if entry.lower().endswith(".pdf") and TEMP_SUFFIX not in entry:
-                scan_files.append(entry)
+        for root, dirs, files in os.walk(WATCH_FOLDER):
+            for file in files:
+                if file.lower().endswith(".pdf") and TEMP_SUFFIX not in file:
+                    full_path = os.path.abspath(os.path.join(root, file))
+                    scan_files.append(full_path)
     except Exception as e:
         print(f"ERROR: Could not read WATCH_FOLDER: {e}")
         sys.exit(1)
 
-    for file_name in scan_files:
-        full_path = os.path.abspath(os.path.join(WATCH_FOLDER, file_name))
+    for full_path in scan_files:
+        file_name = os.path.basename(full_path)
         
         if full_path in manifest:
             skipped_count += 1
@@ -120,9 +122,13 @@ def main():
                 reduction_pct = int(((orig_size - final_size) / orig_size) * 100)
                 
             # d. Upload to Google Drive using rclone
+            rel_path = os.path.relpath(upload_path, WATCH_FOLDER)
+            rel_dir = os.path.dirname(rel_path).replace("\\", "/")
+            dest_folder = f"{GDRIVE_FOLDER}/{rel_dir}" if rel_dir and rel_dir != "." else GDRIVE_FOLDER
+            
             cmd = [
                 "rclone", "copy", upload_path, 
-                f"{GDRIVE_REMOTE}:{GDRIVE_FOLDER}", "--no-traverse"
+                f"{GDRIVE_REMOTE}:{dest_folder}", "--no-traverse"
             ]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
@@ -134,8 +140,8 @@ def main():
             manifest.add(full_path)
             
             # f. Write a log entry
-            log_msg = f"{format_size(orig_size)} \u2192 {format_size(final_size)} ({reduction_pct}% reduction) | uploaded to {GDRIVE_REMOTE}:{GDRIVE_FOLDER}"
-            write_log(file_name, "SUCCESS", log_msg)
+            log_msg = f"{format_size(orig_size)} \u2192 {format_size(final_size)} ({reduction_pct}% reduction) | uploaded to {GDRIVE_REMOTE}:{dest_folder}"
+            write_log(rel_path, "SUCCESS", log_msg)
             
             processed_count += 1
             
