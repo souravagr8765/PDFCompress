@@ -12,11 +12,11 @@ from datetime import datetime
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
-WATCH_FOLDER = "/sdcard/YourFolderName"
-GDRIVE_REMOTE = "gdrive"
-GDRIVE_FOLDER = "YourFolderName"
-MANIFEST_FILE = "/sdcard/YourFolderName/.processed_manifest.txt"
-LOG_FILE = "compressor.log"
+WATCH_FOLDER = "/sdcard/Books/Foundation/"
+GDRIVE_REMOTE = "gdrivestudent.sourav.agarwal"
+GDRIVE_FOLDER = "Foundation2"
+MANIFEST_FILE = "./processed_manifest.txt"
+LOG_FILE = "./logs.log"
 TEMP_SUFFIX = "_compressed_tmp.pdf"
 IMAGE_DPI = 150
 JPEG_QUALITY = 75
