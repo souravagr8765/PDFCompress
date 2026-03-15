@@ -572,7 +572,6 @@ def main():
                 final_size = db_compressed_size
                 status = "skipped_larger" if db_orig_size == db_compressed_size else "compressed"
             elif orig_size == db_compressed_size:
-                logger.info(f"Skipping {full_path} — already processed and unchanged")
                 skipped_count += 1
                 continue
             
