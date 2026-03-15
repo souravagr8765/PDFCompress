@@ -3,3 +3,5 @@ logs.log
 *.log
 __pycache__
 local_cache.db
+Temp
+.vscode
