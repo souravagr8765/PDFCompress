@@ -21,7 +21,7 @@ Constants located within `pdf_sync.py`:
 - `IMAGE_DPI` & `JPEG_QUALITY`: Controls for Ghostscript tuning.
 
 # Configuration Management
-Currently, there is no separated `config/` directory. All environment variables, defaults, and configuration constants are managed directly at the head of `pdf_sync.py`.
+Currently, there is no separated `config/` directory. All environment variables, defaults, and configuration constants are managed directly at the head of `pdf_sync.py`. Environment variables such as `LOKI_URL`, `LOKI_USERNAME`, `LOKI_PASSWORD`, and `JOB_NAME` can be stored in a `.env` file in the same directory as `pdf_sync.py`, which is loaded automatically at runtime.
 
 # Code Workflow
 1. **Initialize script context**: Initialize `logging` (to `compressor.log`), check if `WATCH_FOLDER` exists, and verify `rclone` and `gs` binaries exist in the system's execution PATH.

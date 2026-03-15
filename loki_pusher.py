@@ -7,7 +7,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("loki_pusher")
 
-JOB_NAME = os.getenv("JOB_NAME")
+JOB_NAME = os.getenv("JOB_NAME", "PDF_compressor")
 
 def push_to_loki(lines, loki_url, job_name, auth=None):
     if not lines:

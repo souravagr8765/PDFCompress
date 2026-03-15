@@ -21,7 +21,7 @@ TEMP_SUFFIX = "_compressed_tmp.pdf"
 IMAGE_DPI = 150
 JPEG_QUALITY = 75
 # =============================================================================
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Setup logging
 logging.basicConfig(
     level=logging.DEBUG,
@@ -57,13 +57,22 @@ def format_size(size_val):
     return f"{size_val / (1024 * 1024):.1f}MB"
 
 def main():
+    env_path = os.path.join(BASE_DIR, '.env')
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, val = line.split('=', 1)
+                    os.environ[key.strip()] = val.strip(' "\'')
+
     loki_url = os.getenv('LOKI_URL')
     loki_process = None
     if loki_url:
         loki_user = os.getenv('LOKI_USERNAME', '')
         loki_pass = os.getenv('LOKI_PASSWORD', '')
         
-        log_file = os.path.join(LOGS_DIR, 'logs.log')
+        log_file = os.path.abspath(LOG_FILE)
         current_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
         loki_cmd = [sys.executable, os.path.join(BASE_DIR, 'loki_pusher.py'), log_file, loki_url, str(current_size)]
         if loki_user and loki_pass:
