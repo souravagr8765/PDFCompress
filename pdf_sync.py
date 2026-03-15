@@ -1,39 +1,346 @@
+# =============================================================
+# pdf_sync.py — PDF Compression & Google Drive Sync
+# =============================================================
+# Required .env keys:
+#
+# NHOST_CONNECTION_STRING  — PostgreSQL connection string from Nhost
+# SMTP_HOST                — SMTP server hostname
+# SMTP_PORT                — SMTP port (default: 587)
+# SMTP_USER                — SMTP login username
+# SMTP_PASSWORD            — SMTP login password
+# REPORT_RECIPIENT         — Email address to receive run reports
+# LOKI_URL                 — Loki server URL (optional)
+# LOKI_USERNAME            — Loki username (optional)
+# LOKI_PASSWORD            — Loki password (optional)
+# JOB_NAME                 — Loki job label (optional)
+# =============================================================
 import sys
 import os
-import shutil
-import subprocess
-import traceback
 import logging
-import time
 from datetime import datetime
-import atexit
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
+# --- Paths & Local Storage ---
 WATCH_FOLDER = "/sdcard/Books/Foundation/"
-GDRIVE_REMOTE = "gdrivestudent.sourav.agarwal"
-GDRIVE_FOLDER = "Foundation2"
-MANIFEST_FILE = "./processed_manifest.txt"
+LOCAL_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_cache.db")
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pdf_sync.lock")
 LOG_FILE = "./compressor.log"
 TEMP_SUFFIX = "_compressed_tmp.pdf"
+
+# --- Ghostscript Settings ---
 IMAGE_DPI = 150
 JPEG_QUALITY = 75
+
+# --- Google Drive / rclone ---
+GDRIVE_REMOTE = "gdrivestudent.sourav.agarwal"
+GDRIVE_FOLDER = "Foundation2"
+
+# --- Nhost Online Database ---
+NHOST_CONNECTION_STRING = os.getenv("NHOST_CONNECTION_STRING", "")
+
+# --- SMTP Email Report ---
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+REPORT_RECIPIENT = os.getenv("REPORT_RECIPIENT", "")
+
+# --- Loki Logging ---
+LOKI_URL = os.getenv("LOKI_URL", "")
+LOKI_USERNAME = os.getenv("LOKI_USERNAME", "")
+LOKI_PASSWORD = os.getenv("LOKI_PASSWORD", "")
+JOB_NAME = os.getenv("JOB_NAME", "")
 # =============================================================================
+
+run_stats = {
+    "start_time": None,
+    "end_time": None,
+    "files_compressed": 0,
+    "files_skipped_larger": 0,
+    "files_upload_failed": 0,
+    "retry_recovered": 0,
+    "retry_still_failed": 0,
+    "run_original_bytes": 0,
+    "run_compressed_bytes": 0
+}
+
+def send_report_email(stats):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD or not REPORT_RECIPIENT:
+        if 'logger' in globals():
+            logger.warning("Email report skipped — SMTP credentials not configured")
+        return
+
+    try:
+        conn = sqlite3.connect(LOCAL_DB)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM processed_files")
+        total_rows = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT COUNT(*) FROM processed_files WHERE status = 'compressed'")
+        total_compressed = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT COUNT(*) FROM processed_files WHERE status = 'skipped_larger'")
+        total_skipped = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT SUM(original_size), SUM(compressed_size) FROM processed_files")
+        sums = cursor.fetchone()
+        alltime_orig = sums[0] or 0
+        alltime_comp = sums[1] or 0
+        conn.close()
+        
+        start_time = stats.get('start_time')
+        end_time = stats.get('end_time')
+        duration_sec = int((end_time - start_time).total_seconds()) if start_time and end_time else 0
+        duration_str = f"{duration_sec // 3600}h {(duration_sec % 3600) // 60}m {duration_sec % 60}s"
+        
+        run_orig = stats.get('run_original_bytes', 0)
+        run_comp = stats.get('run_compressed_bytes', 0)
+        run_saved = run_orig - run_comp
+        run_pct = (run_saved / run_orig * 100) if run_orig > 0 else 0
+        
+        alltime_saved = alltime_orig - alltime_comp
+        
+        body = f"""================================================
+PDF Sync — Run Report
+================================================
+
+RUN SUMMARY
+  Start Time    : {start_time.strftime('%Y-%m-%d %H:%M:%S') if start_time else ''}
+  End Time      : {end_time.strftime('%Y-%m-%d %H:%M:%S') if end_time else ''}
+  Duration      : {duration_str}
+
+THIS RUN
+  Compressed         : {stats.get('files_compressed', 0)} files
+  Skipped (optimal)  : {stats.get('files_skipped_larger', 0)} files
+  Upload Failed      : {stats.get('files_upload_failed', 0)} files
+  Retried & Fixed    : {stats.get('retry_recovered', 0)} files
+  Still Failed       : {stats.get('retry_still_failed', 0)} files
+  Original Size      : {format_size(run_orig)}
+  Compressed Size    : {format_size(run_comp)}
+  Space Saved        : {format_size(run_saved)} ({run_pct:.1f}% reduction)
+
+ALL TIME
+  Total Files Tracked : {total_rows}
+  Total Compressed    : {total_compressed}
+  Total Skipped       : {total_skipped}
+  Total Space Saved   : {format_size(alltime_saved)}
+
+================================================"""
+        
+        msg = MIMEMultipart()
+        msg['From'] = SMTP_USER
+        msg['To'] = REPORT_RECIPIENT
+        msg['Subject'] = f"PDF Sync Report — {datetime.now().strftime('%Y-%m-%d')}"
+        msg.attach(MIMEText(body, 'plain'))
+        
+        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        
+        if 'logger' in globals():
+            logger.info("Email report sent successfully")
+    except Exception as e:
+        if 'logger' in globals():
+            logger.error(f"Failed to send email report: {e}")
+
+def acquire_lock():
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r") as f:
+                content = f.read().strip()
+                if "PID:" in content:
+                    parts = content.split("STARTED:")
+                    pid_str = parts[0].replace("PID:", "").strip()
+                    if pid_str.isdigit():
+                        pid = int(pid_str)
+                        try:
+                            os.kill(pid, 0)
+                        except OSError:
+                            print(f"WARNING: Stale lock file found (PID {pid} is not running). Removing stale lock and continuing.")
+                            os.remove(LOCK_FILE)
+                        else:
+                            print(f"CRITICAL: Another instance is already running (lock file found at {LOCK_FILE}). Exiting.")
+                            sys.exit(1)
+                    else:
+                        print(f"CRITICAL: Another instance is already running (lock file found at {LOCK_FILE}). Exiting.")
+                        sys.exit(1)
+                else:
+                    print(f"CRITICAL: Another instance is already running (lock file found at {LOCK_FILE}). Exiting.")
+                    sys.exit(1)
+        except SystemExit:
+            raise
+        except Exception:
+            print(f"CRITICAL: Another instance is already running (lock file found at {LOCK_FILE}). Exiting.")
+            sys.exit(1)
+            
+    try:
+        pid = os.getpid()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOCK_FILE, "w") as f:
+            f.write(f"PID:{pid} STARTED:{timestamp}")
+        print(f"INFO: Lock acquired (PID {pid})")
+    except Exception as e:
+        print(f"ERROR: Failed to acquire lock: {e}")
+        sys.exit(1)
+
+def release_lock():
+    if os.path.exists(LOCK_FILE):
+        try:
+            os.remove(LOCK_FILE)
+            if 'logger' in globals():
+                logger.info("Lock released")
+            else:
+                print("INFO: Lock released")
+        except Exception as e:
+            if 'logger' in globals():
+                logger.warning(f"Failed to release lock: {e}")
+            else:
+                print(f"WARNING: Failed to release lock: {e}")
+
+acquire_lock()
+
+import shutil
+import subprocess
+import traceback
+import time
+import sqlite3
+import atexit
+import psycopg2
+from psycopg2.extras import execute_values
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
-    ]
+   ] 
 )
 logger = logging.getLogger(__name__)
 
 # Global reference to the background loki logger process
 _loki_process = None
+
+def init_local_db():
+    conn = sqlite3.connect(LOCAL_DB)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_files (
+            file_path TEXT PRIMARY KEY,
+            original_size INTEGER,
+            compressed_size INTEGER,
+            status TEXT,
+            processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Local SQLite database initialised")
+
+def get_nhost_conn():
+    if not NHOST_CONNECTION_STRING:
+        logger.warning("NHOST_CONNECTION_STRING not set \u2014 online DB unavailable")
+        return None
+    try:
+        conn = psycopg2.connect(NHOST_CONNECTION_STRING)
+        return conn
+    except Exception as e:
+        logger.error(f"Error connecting to Nhost DB: {e}")
+        return None
+
+def ensure_nhost_table(conn):
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_files (
+                file_path TEXT PRIMARY KEY,
+                original_size BIGINT,
+                compressed_size BIGINT,
+                status TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error creating Nhost table: {e}")
+
+def reconcile_databases():
+    try:
+        local_conn = sqlite3.connect(LOCAL_DB)
+        local_cursor = local_conn.cursor()
+        local_cursor.execute("SELECT COUNT(*) FROM processed_files")
+        local_count = local_cursor.fetchone()[0]
+        
+        nhost_conn = get_nhost_conn()
+        if not nhost_conn:
+            logger.warning("Nhost is unavailable, skipping reconciliation.")
+            local_conn.close()
+            return
+            
+        ensure_nhost_table(nhost_conn)
+        nhost_cursor = nhost_conn.cursor()
+        
+        nhost_cursor.execute("SELECT COUNT(*) FROM processed_files")
+        nhost_count = nhost_cursor.fetchone()[0]
+        
+        if local_count == nhost_count:
+            logger.info(f"Databases in sync ({local_count} records)")
+            local_conn.close()
+            nhost_conn.close()
+            return
+            
+        local_cursor.execute("SELECT file_path FROM processed_files")
+        local_paths = set(row[0] for row in local_cursor.fetchall())
+        
+        nhost_cursor.execute("SELECT file_path FROM processed_files")
+        nhost_paths = set(row[0] for row in nhost_cursor.fetchall())
+        
+        only_in_local = local_paths - nhost_paths
+        only_in_nhost = nhost_paths - local_paths
+        
+        if only_in_local:
+            local_cursor.execute("SELECT file_path, original_size, compressed_size, status, processed_at FROM processed_files")
+            local_all = {row[0]: row for row in local_cursor.fetchall()}
+            push_batch = [local_all[p] for p in only_in_local]
+            execute_values(
+                nhost_cursor,
+                "INSERT INTO processed_files (file_path, original_size, compressed_size, status, processed_at) VALUES %s ON CONFLICT (file_path) DO NOTHING",
+                push_batch
+            )
+            nhost_conn.commit()
+            logger.info(f"Pushed {len(push_batch)} missing records to Nhost")
+            
+        if only_in_nhost:
+            nhost_cursor.execute("SELECT file_path, original_size, compressed_size, status, processed_at FROM processed_files")
+            nhost_all = {row[0]: row for row in nhost_cursor.fetchall()}
+            pull_batch = [nhost_all[p] for p in only_in_nhost]
+            local_cursor.executemany(
+                "INSERT OR REPLACE INTO processed_files (file_path, original_size, compressed_size, status, processed_at) VALUES (?, ?, ?, ?, ?)",
+                pull_batch
+            )
+            local_conn.commit()
+            logger.info(f"Pulled {len(pull_batch)} missing records from local DB")
+            
+        logger.info("Reconciliation complete")
+        
+        local_conn.close()
+        nhost_conn.close()
+    except Exception as e:
+        logger.error(f"Reconciliation failed: {e}")
 
 def cleanup():
     """Terminate background processes on exit."""
@@ -63,7 +370,7 @@ def compress_pdf(input_path, output_path):
         "-dBATCH",
         f"-sOutputFile={output_path}",
         input_path
-    ]
+   ] 
     logger.info(f"Executing Ghostscript command: {' '.join(command)}")
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
@@ -73,25 +380,119 @@ def compress_pdf(input_path, output_path):
     logger.info(f"Ghostscript compression completed for {input_path}")
 
 def format_size(size_val):
-    return f"{size_val / (1024 * 1024):.1f}MB"
+    if size_val is None:
+        return "0.0B"
+    if size_val < 1024:
+        return f"{size_val}B"
+    elif size_val < 1024 * 1024:
+        return f"{size_val / 1024:.1f}KB"
+    elif size_val < 1024 * 1024 * 1024:
+        return f"{size_val / (1024 * 1024):.1f}MB"
+    else:
+        return f"{size_val / (1024 * 1024 * 1024):.1f}GB"
+
+def update_file_status(full_path, orig_size, final_size, status):
+    """Helper to update file status in both local SQLite and Nhost DBs."""
+    try:
+        conn = sqlite3.connect(LOCAL_DB)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO processed_files 
+            (file_path, original_size, compressed_size, status, processed_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (full_path, orig_size, final_size, status))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to update local DB status for {full_path}: {e}")
+
+    try:
+        nhost_conn = get_nhost_conn()
+        if nhost_conn:
+            nhost_cursor = nhost_conn.cursor()
+            nhost_cursor.execute("""
+                INSERT INTO processed_files (file_path, original_size, compressed_size, status, processed_at)
+                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                ON CONFLICT (file_path) DO UPDATE SET
+                    original_size = EXCLUDED.original_size,
+                    compressed_size = EXCLUDED.compressed_size,
+                    status = EXCLUDED.status,
+                    processed_at = CURRENT_TIMESTAMP
+            """, (full_path, orig_size, final_size, status))
+            nhost_conn.commit()
+            nhost_conn.close()
+    except Exception as e:
+        logger.warning(f"Failed to sync record {os.path.basename(full_path)} to Nhost: {e}")
+
+def retry_failed_uploads():
+    """Dedicated retry pass for uploads that failed."""
+    stats = {"retried": 0, "recovered": 0, "still_failed": 0}
+    try:
+        conn = sqlite3.connect(LOCAL_DB)
+        cursor = conn.cursor()
+        cursor.execute('SELECT file_path, original_size, compressed_size, status FROM processed_files WHERE status = "upload_failed"')
+        rows = cursor.fetchall()
+        conn.close()
+        
+        for row in rows:
+            full_path, orig_size, comp_size, status = row
+            stats["retried"] += 1
+            
+            if not os.path.exists(full_path):
+                logger.warning(f"Failed upload file missing locally, cannot retry: {full_path}")
+                stats["still_failed"] += 1
+                continue
+                
+            upload_path = full_path
+            rel_path = os.path.relpath(upload_path, WATCH_FOLDER)
+            rel_dir = os.path.dirname(rel_path).replace("\\", "/")
+            dest_folder = f"{GDRIVE_FOLDER}/{rel_dir}" if rel_dir and rel_dir != "." else GDRIVE_FOLDER
+            
+            cmd = ["rclone", "copy", upload_path, f"{GDRIVE_REMOTE}:{dest_folder}", "--no-traverse"]
+            logger.info(f"Retrying rclone upload for failed file: {' '.join(cmd)}")
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if proc.returncode == 0:
+                stats["recovered"] += 1
+                new_status = "skipped_larger" if orig_size == comp_size else "compressed"
+                update_file_status(full_path, orig_size, comp_size, new_status)
+                logger.info(f"Retry upload succeeded: {full_path}")
+            else:
+                stats["still_failed"] += 1
+                error_msg = proc.stderr.strip() or 'Unknown error'
+                logger.warning(f"Retry upload failed again: {full_path}")
+    except Exception as e:
+        logger.error(f"Error in retry_failed_uploads: {e}")
+        
+    return stats
+
+def cleanup_temp_files():
+    count = 0
+    if not os.path.exists(WATCH_FOLDER):
+        return 0
+    for root, dirs, files in os.walk(WATCH_FOLDER):
+        for file in files:
+            if file.lower().endswith("_temp.pdf"):
+                full_path = os.path.join(root, file)
+                try:
+                    os.remove(full_path)
+                    logger.info(f"Removed stale temp file: {full_path}")
+                    count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to remove stale temp file {full_path}: {e}")
+    logger.info(f"Temp file cleanup complete. Removed {count} file(s).")
+    return count
 
 def main():
     global _loki_process
-    
-    env_path = os.path.join(BASE_DIR, '.env')
-    if os.path.exists(env_path):
-        with open(env_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, val = line.split('=', 1)
-                    os.environ[key.strip()] = val.strip(' "\'')
+    run_stats["start_time"] = datetime.now()
 
     start_pos = 0
     if os.path.exists(LOG_FILE):
         start_pos = os.path.getsize(LOG_FILE)
 
     logger.info("Starting PDF Sync Script")
+    init_local_db()
     
     # Start Loki Logger if environment variables are set
     loki_url = os.environ.get("LOKI_URL")
@@ -112,6 +513,9 @@ def main():
         else:
              logger.warning("loki_logger.py not found. Loki logging will not be available.")
              
+    reconcile_databases()
+    cleanup_temp_files()
+             
     if not os.path.exists(WATCH_FOLDER):
         logger.error(f"WATCH_FOLDER '{WATCH_FOLDER}' does not exist.")
         sys.exit(1)
@@ -123,14 +527,6 @@ def main():
     if not shutil.which("gs"):
         logger.error("Ghostscript (gs) not found. Run: pkg install ghostscript")
         sys.exit(1)
-
-    manifest = set()
-    if os.path.exists(MANIFEST_FILE):
-        with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                path = line.strip()
-                if path:
-                    manifest.add(path)
 
     processed_count = 0
     skipped_count = 0
@@ -152,44 +548,81 @@ def main():
     for full_path in scan_files:
         file_name = os.path.basename(full_path)
         
-        if full_path in manifest:
-            logger.info(f"Skipping {file_name} - already inside manifest.")
-            skipped_count += 1
+        if not os.path.exists(full_path):
             continue
+        orig_size = os.path.getsize(full_path)
+        
+        conn = sqlite3.connect(LOCAL_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT file_path, original_size, compressed_size, status FROM processed_files WHERE file_path = ?", (full_path,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        retry_upload_only = False
+        status = None
+        if row:
+            db_orig_size = row[1]
+            db_compressed_size = row[2]
+            db_status = row[3]
+            
+            if db_status == "upload_failed":
+                logger.info(f"Retrying upload for previously failed file: {full_path}")
+                retry_upload_only = True
+                orig_size = db_orig_size
+                final_size = db_compressed_size
+                status = "skipped_larger" if db_orig_size == db_compressed_size else "compressed"
+            elif orig_size == db_compressed_size:
+                logger.info(f"Skipping {full_path} — already processed and unchanged")
+                skipped_count += 1
+                continue
             
         logger.info(f"Processing {file_name}...")
         temp_path = full_path[:-4] + TEMP_SUFFIX
         
         try:
-            # a. Compress it using Ghostscript
-            orig_size = os.path.getsize(full_path)
-            logger.info(f"Original file size {file_name}: {format_size(orig_size)}")
-            compress_pdf(full_path, temp_path)
-            
-            # b. Validate the compressed file
-            if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-                raise Exception("Compressed temp file is missing or 0 bytes")
+            if not retry_upload_only:
+                # a. Compress it using Ghostscript
+                logger.info(f"Original file size {file_name}: {format_size(orig_size)}")
+                compress_pdf(full_path, temp_path)
                 
-            new_size = os.path.getsize(temp_path)
-            upload_path = full_path
-            
-            # c. Replace the original
-            if new_size < orig_size:
-                logger.info(f"Replacing original file. Compressed size: {format_size(new_size)}")
-                os.remove(full_path)
-                os.rename(temp_path, full_path)
-                final_size = new_size
-            else:
-                # Compressed file larger or equal; keep original
-                logger.info(f"Compression did not reduce size. Keeping original: {format_size(orig_size)}")
-                os.remove(temp_path)
-                final_size = orig_size
+                # b. Validate the compressed file
+                if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                    raise Exception("Compressed temp file is missing or 0 bytes")
+                    
+                new_size = os.path.getsize(temp_path)
                 
+                # c. Replace the original
+                if new_size < orig_size:
+                    logger.info(f"Replacing original file. Compressed size: {format_size(new_size)}")
+                    os.remove(full_path)
+                    os.rename(temp_path, full_path)
+                    final_size = new_size
+                    status = "compressed"
+                else:
+                    # Compressed file larger or equal; keep original
+                    logger.info(f"Compression did not reduce size. Keeping original: {format_size(orig_size)}")
+                    os.remove(temp_path)
+                    final_size = orig_size
+                    status = "skipped_larger"
+                    
+                # d & e. Write to both DBs immediately after compression
+                update_file_status(full_path, orig_size, final_size, status)
+
+                if status == "compressed":
+                    run_stats["files_compressed"] += 1
+                elif status == "skipped_larger":
+                    run_stats["files_skipped_larger"] += 1
+                
+                run_stats["run_original_bytes"] += orig_size
+                run_stats["run_compressed_bytes"] += final_size
+
             reduction_pct = 0
             if orig_size > 0:
                 reduction_pct = int(((orig_size - final_size) / orig_size) * 100)
                 
-            # d. Upload to Google Drive using rclone
+            upload_path = full_path
+                
+            # f. Upload to Google Drive using rclone
             rel_path = os.path.relpath(upload_path, WATCH_FOLDER)
             rel_dir = os.path.dirname(rel_path).replace("\\", "/")
             dest_folder = f"{GDRIVE_FOLDER}/{rel_dir}" if rel_dir and rel_dir != "." else GDRIVE_FOLDER
@@ -197,24 +630,26 @@ def main():
             cmd = [
                 "rclone", "copy", upload_path, 
                 f"{GDRIVE_REMOTE}:{dest_folder}", "--no-traverse"
-            ]
+           ] 
             logger.info(f"Executing rclone upload: {' '.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 error_msg = proc.stderr.strip() or 'Unknown error'
-                logger.error(f"rclone upload failed for {file_name}. Error: {error_msg}")
-                raise Exception(f"rclone upload failed: {error_msg}")
-            
+                # h. If rclone fails: update status to upload_failed in DBs, log error, continue
+                update_file_status(full_path, orig_size, final_size, "upload_failed")
+                logger.error(f"rclone upload failed for {full_path}. stderr: {error_msg}")
+                error_count += 1
+                run_stats["files_upload_failed"] += 1
+                continue # continue to next file without raising exception
+                
+            # g. If rclone succeeds: no DB change needed unless we were retrying
+            if retry_upload_only:
+                update_file_status(full_path, orig_size, final_size, status)
+                
             logger.info(f"Upload successful for {file_name}")
             
-            # e. Update the manifest
-            with open(MANIFEST_FILE, "a", encoding="utf-8") as f:
-                f.write(full_path + "\n")
-            manifest.add(full_path)
-            logger.info(f"{file_name} added to manifest.")
-            
-            # f. Write a log entry
-            log_msg = f"{file_name} | SUCCESS | {format_size(orig_size)} \u2192 {format_size(final_size)} ({reduction_pct}% reduction) | uploaded to {GDRIVE_REMOTE}:{dest_folder}"
+            # write a log entry
+            log_msg = f"{file_name} [SUCCESS] {format_size(orig_size)} \u2192 {format_size(final_size)} ({reduction_pct}% reduction)] uploaded to {GDRIVE_REMOTE}:{dest_folder}"
             logger.info(log_msg)
             
             processed_count += 1
@@ -227,10 +662,32 @@ def main():
                     os.remove(temp_path)
                 except:
                     pass
-            logger.error(f"{file_name} | ERROR | {str(e)}\n{traceback.format_exc()}")
+            logger.error(f"{file_name} [ERROR] {str(e)}\n{traceback.format_exc()}")
             
-    summary_msg = f"PDF Sync complete. Processed: {processed_count} | Skipped: {skipped_count} | Errors: {error_count}"
+    retry_results = retry_failed_uploads()
+    run_stats["retry_recovered"] = retry_results.get("recovered", 0)
+    run_stats["retry_still_failed"] = retry_results.get("still_failed", 0)
+    
+    if retry_results["retried"] > 0:
+        logger.info(f"Retry pass completed: {retry_results}")
+        
+    run_summary = {
+        "processed": processed_count,
+        "skipped": skipped_count,
+        "errors": error_count,
+        "retried": retry_results["retried"],
+        "recovered": retry_results["recovered"],
+        "still_failed": retry_results["still_failed"]
+    }
+        
+    summary_msg = f"PDF Sync complete. Processed: {run_summary['processed']} [Skipped: {run_summary['skipped']} [Errors: {run_summary['errors']}] Retried: {run_summary['retried']} (Recovered: {run_summary['recovered']}, Still Failed: {run_summary['still_failed']})"
     logger.info(summary_msg)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        run_stats["end_time"] = datetime.now()
+        if run_stats["files_compressed"]>0 or run_stats["files_skipped_larger"]>0 or run_stats["files_upload_failed"]>0 or run_stats["retry_recovered"]>0 or run_stats["retry_still_failed"]>0:
+            send_report_email(run_stats)
+        release_lock()
