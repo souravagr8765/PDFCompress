@@ -5,6 +5,7 @@ This project is an automation script (`pdf_sync.py`) designed to monitor a speci
 - `pdf_sync.py`: The main orchestrating Python script that handles directory scanning, compression tracking, and cloud uploading.
 - **Ghostscript (`gs`)**: External dependency used under the hood to perform the actual PDF optimizations and reductions.
 - **rclone**: External dependency utilized for synchronizing and uploading final output files to a remote destination (Google Drive).
+- `loki_logger.py`: A background daemon script that continuously pushes runtime logs from `compressor.log` to a centralized Loki server.
 
 # Database Schema
 There is no traditional relational database. 
@@ -24,7 +25,7 @@ Constants located within `pdf_sync.py`:
 Currently, there is no separated `config/` directory. All environment variables, defaults, and configuration constants are managed directly at the head of `pdf_sync.py`. Environment variables such as `LOKI_URL`, `LOKI_USERNAME`, `LOKI_PASSWORD`, and `JOB_NAME` can be stored in a `.env` file in the same directory as `pdf_sync.py`, which is loaded automatically at runtime.
 
 # Code Workflow
-1. **Initialize script context**: Initialize `logging` (to `compressor.log`), check if `WATCH_FOLDER` exists, and verify `rclone` and `gs` binaries exist in the system's execution PATH.
+1. **Initialize script context**: Initialize `logging` (to `compressor.log`), check if `WATCH_FOLDER` exists, and verify `rclone` and `gs` binaries exist in the system's execution PATH. Read `.env` for Loki configuration; if found, spawn the `loki_logger.py` subprocess in the background to handle remote log aggregation.
 2. **Read Manifest**: Retrieve cache of processed files by reading `.processed_manifest.txt`.
 3. **Scan Files**: Walk `WATCH_FOLDER` tree recursively to identify unprocessed `.pdf` files.
 4. **Iterative Processing**: For every target file:

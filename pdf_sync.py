@@ -1,13 +1,12 @@
-# pkg install ghostscript
-# rclone must be installed and configured separately
-
 import sys
 import os
 import shutil
 import subprocess
 import traceback
 import logging
+import time
 from datetime import datetime
+import atexit
 
 # =============================================================================
 # CONFIGURATION
@@ -16,7 +15,7 @@ WATCH_FOLDER = "/sdcard/Books/Foundation/"
 GDRIVE_REMOTE = "gdrivestudent.sourav.agarwal"
 GDRIVE_FOLDER = "Foundation2"
 MANIFEST_FILE = "./processed_manifest.txt"
-LOG_FILE = "./logs.log"
+LOG_FILE = "./compressor.log"
 TEMP_SUFFIX = "_compressed_tmp.pdf"
 IMAGE_DPI = 150
 JPEG_QUALITY = 75
@@ -24,7 +23,7 @@ JPEG_QUALITY = 75
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Setup logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
@@ -32,6 +31,26 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Global reference to the background loki logger process
+_loki_process = None
+
+def cleanup():
+    """Terminate background processes on exit."""
+    global _loki_process
+    if _loki_process is not None:
+        logger.info("Terminating background Loki logger...")
+        try:
+             # Send termination signal via log file
+             logger.info("LOKI_LOGGER_TERMINATE")
+             _loki_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _loki_process.kill()
+        except Exception as e:
+            logger.error(f"Error terminating Loki logger: {e}")
+        logger.info("Loki logger terminated.")
+
+atexit.register(cleanup)
 
 def compress_pdf(input_path, output_path):
     command = [
@@ -45,18 +64,20 @@ def compress_pdf(input_path, output_path):
         f"-sOutputFile={output_path}",
         input_path
     ]
-    logger.debug(f"Executing Ghostscript command: {' '.join(command)}")
+    logger.info(f"Executing Ghostscript command: {' '.join(command)}")
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if result.returncode != 0:
         error_msg = result.stderr.decode()
         logger.error(f"Ghostscript failed for {input_path}. Error: {error_msg}")
         raise RuntimeError(f"Ghostscript failed: {error_msg}")
-    logger.debug(f"Ghostscript compression completed for {input_path}")
+    logger.info(f"Ghostscript compression completed for {input_path}")
 
 def format_size(size_val):
     return f"{size_val / (1024 * 1024):.1f}MB"
 
 def main():
+    global _loki_process
+    
     env_path = os.path.join(BASE_DIR, '.env')
     if os.path.exists(env_path):
         with open(env_path, 'r', encoding='utf-8') as f:
@@ -66,30 +87,31 @@ def main():
                     key, val = line.split('=', 1)
                     os.environ[key.strip()] = val.strip(' "\'')
 
-    loki_url = os.getenv('LOKI_URL')
-    loki_process = None
-    if loki_url:
-        loki_user = os.getenv('LOKI_USERNAME', '')
-        loki_pass = os.getenv('LOKI_PASSWORD', '')
-        
-        log_file = os.path.abspath(LOG_FILE)
-        current_size = os.path.getsize(log_file) if os.path.exists(log_file) else 0
-        loki_cmd = [sys.executable, os.path.join(BASE_DIR, 'loki_pusher.py'), log_file, loki_url, str(current_size)]
-        if loki_user and loki_pass:
-            loki_cmd.extend([loki_user, loki_pass])
-            
-        loki_process = subprocess.Popen(loki_cmd)
-        
-        def stop_loki():
-            if loki_process and loki_process.poll() is None:
-                loki_process.terminate()
-                try:
-                    loki_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    loki_process.kill()
-        atexit.register(stop_loki)
+    start_pos = 0
+    if os.path.exists(LOG_FILE):
+        start_pos = os.path.getsize(LOG_FILE)
 
     logger.info("Starting PDF Sync Script")
+    
+    # Start Loki Logger if environment variables are set
+    loki_url = os.environ.get("LOKI_URL")
+    if loki_url:
+        loki_script_path = os.path.join(BASE_DIR, "loki_logger.py")
+        if os.path.exists(loki_script_path):
+            logger.info(f"Starting background Loki logger streaming to {loki_url}")
+            try:
+                # Start as a separate process group so it doesn't receive signals meant for the parent
+                _loki_process = subprocess.Popen(
+                    [sys.executable, loki_script_path, LOG_FILE, str(start_pos)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True # Windows equivalent of os.setsid or preexec_fn=os.setsid
+                )
+            except Exception as e:
+                logger.error(f"Failed to start Loki logger subprocess: {e}")
+        else:
+             logger.warning("loki_logger.py not found. Loki logging will not be available.")
+             
     if not os.path.exists(WATCH_FOLDER):
         logger.error(f"WATCH_FOLDER '{WATCH_FOLDER}' does not exist.")
         sys.exit(1)
@@ -116,7 +138,7 @@ def main():
 
     scan_files = []
     try:
-        logger.debug(f"Scanning WATCH_FOLDER '{WATCH_FOLDER}' for PDF files...")
+        logger.info(f"Scanning WATCH_FOLDER '{WATCH_FOLDER}' for PDF files...")
         for root, dirs, files in os.walk(WATCH_FOLDER):
             for file in files:
                 if file.lower().endswith(".pdf") and TEMP_SUFFIX not in file:
@@ -131,7 +153,7 @@ def main():
         file_name = os.path.basename(full_path)
         
         if full_path in manifest:
-            logger.debug(f"Skipping {file_name} - already inside manifest.")
+            logger.info(f"Skipping {file_name} - already inside manifest.")
             skipped_count += 1
             continue
             
@@ -141,7 +163,7 @@ def main():
         try:
             # a. Compress it using Ghostscript
             orig_size = os.path.getsize(full_path)
-            logger.debug(f"Original file size {file_name}: {format_size(orig_size)}")
+            logger.info(f"Original file size {file_name}: {format_size(orig_size)}")
             compress_pdf(full_path, temp_path)
             
             # b. Validate the compressed file
@@ -153,13 +175,13 @@ def main():
             
             # c. Replace the original
             if new_size < orig_size:
-                logger.debug(f"Replacing original file. Compressed size: {format_size(new_size)}")
+                logger.info(f"Replacing original file. Compressed size: {format_size(new_size)}")
                 os.remove(full_path)
                 os.rename(temp_path, full_path)
                 final_size = new_size
             else:
                 # Compressed file larger or equal; keep original
-                logger.debug(f"Compression did not reduce size. Keeping original: {format_size(orig_size)}")
+                logger.info(f"Compression did not reduce size. Keeping original: {format_size(orig_size)}")
                 os.remove(temp_path)
                 final_size = orig_size
                 
@@ -176,20 +198,20 @@ def main():
                 "rclone", "copy", upload_path, 
                 f"{GDRIVE_REMOTE}:{dest_folder}", "--no-traverse"
             ]
-            logger.debug(f"Executing rclone upload: {' '.join(cmd)}")
+            logger.info(f"Executing rclone upload: {' '.join(cmd)}")
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 error_msg = proc.stderr.strip() or 'Unknown error'
                 logger.error(f"rclone upload failed for {file_name}. Error: {error_msg}")
                 raise Exception(f"rclone upload failed: {error_msg}")
             
-            logger.debug(f"Upload successful for {file_name}")
+            logger.info(f"Upload successful for {file_name}")
             
             # e. Update the manifest
             with open(MANIFEST_FILE, "a", encoding="utf-8") as f:
                 f.write(full_path + "\n")
             manifest.add(full_path)
-            logger.debug(f"{file_name} added to manifest.")
+            logger.info(f"{file_name} added to manifest.")
             
             # f. Write a log entry
             log_msg = f"{file_name} | SUCCESS | {format_size(orig_size)} \u2192 {format_size(final_size)} ({reduction_pct}% reduction) | uploaded to {GDRIVE_REMOTE}:{dest_folder}"
