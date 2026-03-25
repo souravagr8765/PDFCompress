@@ -13,6 +13,8 @@
 # LOKI_USERNAME            — Loki username (optional)
 # LOKI_PASSWORD            — Loki password (optional)
 # JOB_NAME                 — Loki job label (optional)
+# TELEGRAM_BOT_API         — Telegram Bot token (optional)
+# CHAT_ID                  — Comma-separated Telegram chat IDs (optional)
 # =============================================================
 import sys
 import os
@@ -21,6 +23,7 @@ from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import requests
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -59,6 +62,10 @@ LOKI_URL = os.getenv("LOKI_URL", "")
 LOKI_USERNAME = os.getenv("LOKI_USERNAME", "")
 LOKI_PASSWORD = os.getenv("LOKI_PASSWORD", "")
 JOB_NAME = os.getenv("JOB_NAME", "")
+
+# --- Telegram Notification ---
+TELEGRAM_BOT_API = os.getenv("TELEGRAM_BOT_API", "")
+CHAT_IDS = [cid.strip() for cid in os.getenv("CHAT_ID", "").split(",") if cid.strip()]
 # =============================================================================
 
 run_stats = {
@@ -483,6 +490,43 @@ def cleanup_temp_files():
     logger.info(f"Temp file cleanup complete. Removed {count} file(s).")
     return count
 
+def send_telegram_file_list(uploaded_files):
+    """Send the list of successfully uploaded files to all Telegram chat IDs.
+    
+    Args:
+        uploaded_files: list of tuples (filename, orig_size, final_size, reduction_pct)
+    """
+    if not TELEGRAM_BOT_API or not CHAT_IDS:
+        logger.warning("Telegram notification skipped — bot token or chat IDs not configured")
+        return
+
+    if not uploaded_files:
+        logger.info("No successfully uploaded files to report via Telegram")
+        return
+
+    header = f"✅ *PDF Sync — Uploaded Files*\n_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_\n\n"
+    lines = [f"{i+1}. `{name}` ({format_size(orig)} → {format_size(final)}, {pct}% reduced)" for i, (name, orig, final, pct) in enumerate(uploaded_files)]
+    body = header + "\n".join(lines) + f"\n\n*Total: {len(uploaded_files)} file(s)*"
+
+    # Telegram has a 4096 char limit per message; split if needed
+    chunks = [body[i:i+4096] for i in range(0, len(body), 4096)]
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API}/sendMessage"
+    for chat_id in CHAT_IDS:
+        for chunk in chunks:
+            try:
+                resp = requests.post(url, json={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "Markdown"
+                }, timeout=15)
+                if resp.status_code == 200:
+                    logger.info(f"Telegram file list sent to chat {chat_id}")
+                else:
+                    logger.warning(f"Telegram API returned {resp.status_code} for chat {chat_id}: {resp.text}")
+            except Exception as e:
+                logger.error(f"Failed to send Telegram message to chat {chat_id}: {e}")
+
 def main():
     global _loki_process
     run_stats["start_time"] = datetime.now()
@@ -544,6 +588,8 @@ def main():
     except Exception as e:
         logger.error(f"Could not read WATCH_FOLDER: {e}")
         sys.exit(1)
+
+    uploaded_files = []  # Track successfully uploaded files for Telegram notification
 
     for full_path in scan_files:
         file_name = os.path.basename(full_path)
@@ -646,6 +692,7 @@ def main():
                 update_file_status(full_path, orig_size, final_size, status)
                 
             logger.info(f"Upload successful for {file_name}")
+            uploaded_files.append((file_name, orig_size, final_size, reduction_pct))
             
             # write a log entry
             log_msg = f"{file_name} [SUCCESS] {format_size(orig_size)} \u2192 {format_size(final_size)} ({reduction_pct}% reduction)] uploaded to {GDRIVE_REMOTE}:{dest_folder}"
@@ -661,7 +708,7 @@ def main():
                     os.remove(temp_path)
                 except:
                     pass
-            logger.error(f"{file_name} [ERROR] {str(e)}\n{traceback.format_exc()}")
+            logger.error(f"{file_name} [ERROR] {str(e)}{traceback.format_exc()}")
             
     retry_results = retry_failed_uploads()
     run_stats["retry_recovered"] = retry_results.get("recovered", 0)
@@ -681,6 +728,9 @@ def main():
         
     summary_msg = f"PDF Sync complete. Processed: {run_summary['processed']} [Skipped: {run_summary['skipped']} [Errors: {run_summary['errors']}] Retried: {run_summary['retried']} (Recovered: {run_summary['recovered']}, Still Failed: {run_summary['still_failed']})"
     logger.info(summary_msg)
+
+    # Send the list of successfully uploaded files to Telegram
+    send_telegram_file_list(uploaded_files)
 
 if __name__ == "__main__":
     try:
