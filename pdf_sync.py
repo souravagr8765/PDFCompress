@@ -229,15 +229,15 @@ from psycopg2.extras import execute_values
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-   ] 
-)
-logger = logging.getLogger(__name__)
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s [%(levelname)s] %(message)s',
+#     handlers=[
+#         logging.FileHandler(LOG_FILE, encoding='utf-8'),
+#         logging.StreamHandler(sys.stdout)
+#    ] 
+# )
+# logger = logging.getLogger(__name__)
 
 # Global reference to the background loki logger process
 _loki_process = None
