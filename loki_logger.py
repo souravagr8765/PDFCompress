@@ -1,138 +1,210 @@
 import os
-import sys
 import time
+import requests
 import json
-import socket
-import urllib.request
-import urllib.error
-import base64
-import re
 from datetime import datetime
+from dotenv import load_dotenv
+import logging
 
-LOG_TIMESTAMP_REGEX = re.compile(r'^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}(?:,\d+)?)\s*\|')
+# Load environment variables
+load_dotenv()
 
-DEVICE_NAME = os.getenv("DEVICE_NAME", "OPPO_K13_5G")
+# Log file goes to project root, not inside infra/
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, "compressor.log")
 
-def parse_log_timestamp(line, default_ts_ns):
-    match = LOG_TIMESTAMP_REGEX.match(line)
-    if match:
-        timestamp_str = match.group(1)
+LOKI_URL = os.getenv("LOKI_URL")
+LOKI_USER_ID = os.getenv("LOKI_USERNAME")
+LOKI_API_TOKEN = os.getenv("LOKI_PASSWORD")
+DEVICE_NAME = os.getenv("DEVICE_NAME", "Unknown_Device")
+SERVICE_NAME = os.getenv("JOB_NAME", "Unknown_Service")
+
+if not LOKI_URL or not LOKI_USER_ID or not LOKI_API_TOKEN:
+    print("❌ Missing Loki configuration in .env. Please add LOKI_URL, LOKI_USER_ID, and LOKI_API_TOKEN.")
+
+# Ensure the URL has the correct endpoint path
+LOKI_PUSH_URL = ""
+if LOKI_URL:
+    LOKI_PUSH_URL = LOKI_URL.rstrip("/") + "/loki/api/v1/push"
+
+# Configure a module-level standard logger for local fallback (if needed)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+_internal_logger = logging.getLogger("lg")
+
+import threading
+import queue
+import atexit
+
+# Queue for background log pushing
+log_queue = queue.Queue()
+_exit_event = threading.Event()
+
+def _loki_worker():
+    while not _exit_event.is_set():
+        # Wait up to 5 seconds to batch logs, or until exit is signaled
+        _exit_event.wait(5.0)
+        
+        batch = []
+        while True:
+            try:
+                # Pluck all available items from the queue
+                log_item = log_queue.get_nowait()
+                if log_item is None:
+                    log_queue.task_done()
+                    continue
+                batch.append(log_item)
+                log_queue.task_done()
+            except queue.Empty:
+                break
+                
+        if batch:
+            # Loki requires logs to be strictly in chronological order per stream
+            batch.sort(key=lambda x: int(x[0]))
+
+            
+            # Send in chunks of 1000 to prevent payload size issues
+            chunk_size = 1000
+            for i in range(0, len(batch), chunk_size):
+                chunk = batch[i:i+chunk_size]
+                try:
+                    _push_batch_to_loki(chunk)
+                except Exception as e:
+                    print(f"⚠️ Failsafe batch push error: {e}")
+
+# Start background thread
+_worker_thread = threading.Thread(target=_loki_worker, daemon=True)
+_worker_thread.start()
+
+def _cleanup_logger():
+    # Signal the thread to wake up and process the final batch immediately
+    _exit_event.set()
+    log_queue.put(None) # Give queue a prod just in case
+    _worker_thread.join(timeout=5.0)
+
+atexit.register(_cleanup_logger)
+
+def _format_and_push(level: str, msg: str, *args):
+    # Format the message like traditional logging if args exist
+    if args:
         try:
-            if ',' in timestamp_str:
-                dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S,%f')
-            else:
-                dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
-            return str(int(dt.timestamp() * 1e9))
-        except ValueError:
-            pass
-    return default_ts_ns
+            formatted_msg = msg % args
+        except Exception:
+            formatted_msg = msg + " " + str(args)
+    else:
+        formatted_msg = str(msg)
 
-def push_to_loki(log_lines, url, username, password, job_name):
-    """Pushes a list of log lines to Loki."""
-    if not log_lines:
+    # Capture the current time ONCE — this is the single source of truth
+    now = datetime.now()
+
+    # Still log to console/file for visibility (the internal logger adds its own timestamp)
+    if level == "INFO": _internal_logger.info(formatted_msg)
+    elif level == "WARNING": _internal_logger.warning(formatted_msg)
+    elif level == "ERROR": _internal_logger.error(formatted_msg)
+    elif level == "CRITICAL": _internal_logger.critical(formatted_msg)
+    elif level == "DEBUG": _internal_logger.debug(formatted_msg)
+
+    # Use the application's datetime as Loki's timestamp (not upload time).
+    # Level is sent as a Loki label, so no need to embed it in the log text.
+    timestamp_ns = str(int(now.timestamp() * 1e9))
+    log_queue.put((timestamp_ns, level.lower(), formatted_msg))
+
+def info(msg, *args, **kwargs):
+    _format_and_push("INFO", msg, *args)
+
+def warning(msg, *args, **kwargs):
+    _format_and_push("WARNING", msg, *args)
+
+def error(msg, *args, **kwargs):
+    _format_and_push("ERROR", msg, *args)
+
+def critical(msg, *args, **kwargs):
+    _format_and_push("CRITICAL", msg, *args)
+
+def debug(msg, *args, **kwargs):
+    _format_and_push("DEBUG", msg, *args)
+
+def push_to_loki(log_line):
+    # Backward compatibility if anything calls this directly
+    timestamp_ns = str(time.time_ns())
+    log_queue.put((timestamp_ns, "info", log_line))
+
+def _push_batch_to_loki(batch):
+    """Pushes a batch of log lines to the Loki server, grouped by level."""
+    if not LOKI_PUSH_URL:
         return
-        
-    try:
-        # Prepare the payload for Loki
-        # Loki expects timestamp in nanoseconds as strings
-        values = []
-        last_ts = str(int(time.time() * 1e9))
-        
-        for line in log_lines:
-            ts = parse_log_timestamp(line, last_ts)
-            values.append([ts, line.strip()])
-            last_ts = ts
-        
-        payload = {
-            "streams": [
-                {
-                    "stream": {
-                        "service_name": job_name,
-                        "device": DEVICE_NAME
-                    },
-                    "values": values
-                }
-            ]
-        }
-        
-        data = json.dumps(payload).encode('utf-8')
-        
-        req = urllib.request.Request(url + "/loki/api/v1/push", data=data)
-        req.add_header('Content-Type', 'application/json')
-        
-        if username and password:
-            auth_str = f"{username}:{password}"
-            b64_auth_str = base64.b64encode(auth_str.encode('ascii')).decode('ascii')
-            req.add_header('Authorization', f'Basic {b64_auth_str}')
-            
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.getcode() != 204:
-                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] loki_logger: Failed to push to Loki. Status: {response.getcode()}", file=sys.stderr)
-            
-    except urllib.error.URLError as e:
-         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] loki_logger: Network error sending to Loki: {e}", file=sys.stderr)
-    except Exception as e:
-         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] loki_logger: Error sending to Loki: {e}", file=sys.stderr)
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python loki_logger.py <log_file_path> [<start_pos>]", file=sys.stderr)
-        sys.exit(1)
-        
-    log_file = sys.argv[1]
-    start_pos = int(sys.argv[2]) if len(sys.argv) > 2 else -1
-    
-    url = os.environ.get("LOKI_URL")
-    username = os.environ.get("LOKI_USERNAME")
-    password = os.environ.get("LOKI_PASSWORD")
-    job_name = os.environ.get("JOB_NAME", "pdf_compressor_agent")
-    
-    if not url:
-        print("loki_logger: LOKI_URL environment variable is required.", file=sys.stderr)
-        sys.exit(1)
-        
-    print(f"loki_logger: Starting to watch {log_file} and pushing to {url} as job '{job_name}'")
-    
-    # Wait for the log file to exist before starting to tail it
-    while not os.path.exists(log_file):
-        time.sleep(1)
-        
-    log_buffer = []
-    last_push_time = time.time()
-    
+    # Group log entries by level so each level gets its own Loki stream
+    from collections import defaultdict
+    level_groups = defaultdict(list)
+    level_last_ts = defaultdict(int)
+
+    for timestamp_ns, level, log_line in batch:
+        ts = int(timestamp_ns)
+        # Ensure timestamps are strictly increasing per stream
+        if ts <= level_last_ts[level]:
+            ts = level_last_ts[level] + 1
+        level_last_ts[level] = ts
+        level_groups[level].append([str(ts), log_line.strip()])
+
+    streams = []
+    for level, values in level_groups.items():
+        streams.append({
+            "stream": {
+                "service_name": SERVICE_NAME,
+                "device": DEVICE_NAME,
+                "level": level
+            },
+            "values": values
+        })
+
+    payload = {"streams": streams}
+
     try:
-        with open(log_file, 'r', encoding='utf-8') as f:
-            if start_pos >= 0:
-                f.seek(start_pos)
-            else:
-                f.seek(0, os.SEEK_END)
-                
-            while True:
-                line = f.readline()
-                current_time = time.time()
-                
-                if line:
-                    if "LOKI_LOGGER_TERMINATE" in line:
-                        break  # Stop processing upon receiving termination signal
-                    log_buffer.append(line)
-                    
-                # Push logs every 5 seconds or when buffer gets large
-                if len(log_buffer) >= 100 or (log_buffer and current_time - last_push_time >= 5.0):
-                    push_to_loki(log_buffer, url, username, password, job_name)
-                    log_buffer = []
-                    last_push_time = current_time
-                    
-                if not line:
-                    time.sleep(0.5)
-                    
-    except KeyboardInterrupt:
-        print("loki_logger: Terminating due to KeyboardInterrupt...", file=sys.stderr)
+        response = requests.post(
+            LOKI_PUSH_URL,
+            auth=(LOKI_USER_ID, LOKI_API_TOKEN),
+            headers={"Content-type": "application/json"},
+            json=payload,
+            timeout=10
+        )
+        
+        if response.status_code != 204:
+            print(f"⚠️ Failed to push log batch. Status: {response.status_code}, Response: {response.text}")
+            
     except Exception as e:
-        print(f"loki_logger: Error reading file: {e}", file=sys.stderr)
-    finally:
-        if log_buffer:
-             push_to_loki(log_buffer, url, username, password, job_name)
-        print("loki_logger: Exited nicely.", file=sys.stderr)
+        print(f"⚠️ Loki connection error during batch push: {e}")
+
+def watch_log_file(file_path):
+    """Tails the log file continuously and pushes new lines to Loki."""
+    if not os.path.exists(file_path):
+        print(f"⏳ Waiting for {file_path} to be created...")
+        while not os.path.exists(file_path):
+            time.sleep(1)
+            
+    print(f"👀 Watching {file_path} for new logs...")
+    
+    with open(file_path, "r", encoding="utf-8") as file:
+        # Seek to the end of the file to only read new logs
+        file.seek(0, 2)
+        
+        while True:
+            line = file.readline()
+            if not line:
+                time.sleep(0.5) # Wait briefly before checking again
+                continue
+                
+            push_to_loki(line)
 
 if __name__ == "__main__":
-    main()
+    try:
+        watch_log_file(LOG_FILE)
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped watching logs.")

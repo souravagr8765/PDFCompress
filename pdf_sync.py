@@ -18,7 +18,7 @@
 # =============================================================
 import sys
 import os
-import logging
+import loki_logger as logger
 from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
@@ -33,19 +33,19 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 # =============================================================================
 
 # --- Paths & Local Storage ---
-WATCH_FOLDER = "/sdcard/Books/Foundation/"
-LOCAL_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_cache.db")
+WATCH_FOLDER = os.getenv("WATCH_FOLDER", "")
+LOCAL_DB = os.getenv("LOCAL_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_cache.db"))
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pdf_sync.lock")
-LOG_FILE = "./compressor.log"
+LOG_FILE = os.getenv("LOG_FILE", "./compressor.log")
 TEMP_SUFFIX = "_compressed_tmp.pdf"
 
 # --- Ghostscript Settings ---
-IMAGE_DPI = 150
-JPEG_QUALITY = 75
+IMAGE_DPI = os.getenv("IMAGE_DPI", "150")
+JPEG_QUALITY = os.getenv("JPEG_QUALITY", "75")
 
 # --- Google Drive / rclone ---
-GDRIVE_REMOTE = "gdrivestudent.sourav.agarwal"
-GDRIVE_FOLDER = "Foundation2"
+GDRIVE_REMOTE = os.getenv("GDRIVE_REMOTE", "")
+GDRIVE_FOLDER = os.getenv("GDRIVE_FOLDER", "")
 
 # --- Nhost Online Database ---
 NHOST_CONNECTION_STRING = os.getenv("NHOST_CONNECTION_STRING", "")
@@ -528,38 +528,42 @@ def send_telegram_file_list(uploaded_files):
                 logger.error(f"Failed to send Telegram message to chat {chat_id}: {e}")
 
 def main():
-    global _loki_process
-    run_stats["start_time"] = datetime.now()
+    # global _loki_process
+    # run_stats["start_time"] = datetime.now()
 
-    start_pos = 0
-    if os.path.exists(LOG_FILE):
-        start_pos = os.path.getsize(LOG_FILE)
+    # start_pos = 0
+    # if os.path.exists(LOG_FILE):
+    #     start_pos = os.path.getsize(LOG_FILE)
 
-    logger.info("Starting PDF Sync Script")
-    init_local_db()
+    # logger.info("Starting PDF Sync Script")
+    # init_local_db()
     
-    # Start Loki Logger if environment variables are set
-    loki_url = os.environ.get("LOKI_URL")
-    if loki_url:
-        loki_script_path = os.path.join(BASE_DIR, "loki_logger.py")
-        if os.path.exists(loki_script_path):
-            logger.info(f"Starting background Loki logger streaming to {loki_url}")
-            try:
-                # Start as a separate process group so it doesn't receive signals meant for the parent
-                _loki_process = subprocess.Popen(
-                    [sys.executable, loki_script_path, LOG_FILE, str(start_pos)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True # Windows equivalent of os.setsid or preexec_fn=os.setsid
-                )
-            except Exception as e:
-                logger.error(f"Failed to start Loki logger subprocess: {e}")
-        else:
-             logger.warning("loki_logger.py not found. Loki logging will not be available.")
+    # # Start Loki Logger if environment variables are set
+    # loki_url = os.environ.get("LOKI_URL")
+    # if loki_url:
+    #     loki_script_path = os.path.join(BASE_DIR, "loki_logger.py")
+    #     if os.path.exists(loki_script_path):
+    #         logger.info(f"Starting background Loki logger streaming to {loki_url}")
+    #         try:
+    #             # Start as a separate process group so it doesn't receive signals meant for the parent
+    #             _loki_process = subprocess.Popen(
+    #                 [sys.executable, loki_script_path, LOG_FILE, str(start_pos)],
+    #                 stdout=subprocess.DEVNULL,
+    #                 stderr=subprocess.DEVNULL,
+    #                 start_new_session=True # Windows equivalent of os.setsid or preexec_fn=os.setsid
+    #             )
+    #         except Exception as e:
+    #             logger.error(f"Failed to start Loki logger subprocess: {e}")
+    #     else:
+    #          logger.warning("loki_logger.py not found. Loki logging will not be available.")
              
     reconcile_databases()
     cleanup_temp_files()
-             
+
+    if not WATCH_FOLDER or not GDRIVE_REMOTE or not GDRIVE_FOLDER:
+        logger.error("WATCH_FOLDER, GDRIVE_REMOTE, or GDRIVE_FOLDER is not configured.")
+        sys.exit(1)
+
     if not os.path.exists(WATCH_FOLDER):
         logger.error(f"WATCH_FOLDER '{WATCH_FOLDER}' does not exist.")
         sys.exit(1)
