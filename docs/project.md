@@ -3,13 +3,14 @@ This project is an automation script (`pdf_sync.py`) designed to monitor a speci
 
 # System Architecture
 - `pdf_sync.py`: The main orchestrating Python script that handles directory scanning, compression tracking, and cloud uploading.
+- `migrate_db.py`: A utility script used safely to migrate existing databases to include SHA-256 hashes against recognized files.
 - **Ghostscript (`gs`)**: External dependency used under the hood to perform the actual PDF optimizations and reductions.
 - **rclone**: External dependency utilized for synchronizing and uploading final output files to a remote destination (Google Drive).
 - `loki_logger.py`: A background daemon script that continuously pushes runtime logs from `compressor.log` to a centralized Loki server.
 
 # Database Schema
 The script uses a local SQLite database (`local_cache.db`) to track the state of processed files, which is also synchronized with a remote Nhost PostgreSQL database for state consistency.
-- **Table `processed_files`**: Stores `file_path` (PRIMARY KEY, uses cross-platform relative paths for seamless Termux/Windows sync while falling back to absolute where historically used), `original_size`, `compressed_size`, `status` (`compressed`, `skipped_larger`, or `upload_failed`), and `processed_at` timestamp. This prevents infinite loops, redundant recompression tasks, gracefully handles interrupted or failed uploads, and ensures files modified after compression are correctly re-evaluated. Both local SQLite and Nhost PostgreSQL maintain this same schema.
+- **Table `processed_files`**: Stores `file_path` (PRIMARY KEY, uses cross-platform relative paths for seamless Termux/Windows sync while falling back to absolute where historically used), `file_hash` (stores the SHA-256 content hash to safeguard against rename/move operations), `original_size`, `compressed_size`, `status` (`compressed`, `skipped_larger`, or `upload_failed`), and `processed_at` timestamp. This prevents infinite loops, redundant recompression tasks, gracefully handles interrupted or failed uploads, and ensures files modified after compression are correctly re-evaluated. Both local SQLite and Nhost PostgreSQL maintain this same schema.
 
 # Environment Configuration
 Configuration is currently declared statically within the script body, simplifying the single-file portability.
@@ -39,11 +40,13 @@ Currently, there is no separated `config/` directory. All environment variables,
 5. **Scan Files**: Walk `WATCH_FOLDER` tree recursively to identify `.pdf` files.
 6. **Telegram File List Notification**: Before compression begins, the complete list of scanned PDF files (with filenames and sizes) is sent to all Telegram chat IDs configured in `CHAT_ID`, using the bot token from `TELEGRAM_BOT_API`. Messages exceeding Telegram's 4096-character limit are automatically chunked.
 7. **Iterative Processing**: For every target file:
-   - Query the `processed_files` SQLite table. If the file exists and its current size matches the `compressed_size` in the database, skip it (unless status is `upload_failed`).
-   - If status is `upload_failed`, skip Ghostscript processing entirely and immediately retry the `rclone copy` upload directly.
+   - **Fast-Pass Lookup**: Query the `processed_files` SQLite table by `file_path`. If the file exists and its current size matches the expected size (`original_size` or `compressed_size`), immediately skip it (0-cost CPU time).
+   - If `status` is `upload_failed`, skip Ghostscript processing entirely and immediately retry the `rclone copy` upload directly.
+   - **Deep-Check Hash Fallback**: If the `file_path` is not recognized, compute its SHA-256 hash. Query the database by `file_hash`. If the hash exists, copy the history over to the new file path, queue for `rclone` upload, and skip Ghostscript entirely (this makes the script immune to files being renamed or folders being moved).
    - Run Ghostscript on the input file, outputting to a temporary suffix.
    - Validate target output dimensions vs original size.
    - If output is smaller, swap files. Otherwise, retain original and drop temp file.
+   - Compute the `file_hash` of the final resulting file on disk.
    - Immediately update both the local SQLite database and the remote Nhost PostgreSQL `processed_files` tables using `UPSERT` semantics.
    - Run a subprocess calling `rclone copy` to ship the final payload to Google Drive.
    - If the upload fails, do not throw an exception. Instead, flag the record in both databases with `upload_failed` and continue to the next file.

@@ -225,6 +225,7 @@ import time
 import sqlite3
 import atexit
 import psycopg2
+import hashlib
 from psycopg2.extras import execute_values
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -248,6 +249,7 @@ def init_local_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
             file_path TEXT PRIMARY KEY,
+            file_hash TEXT,
             original_size INTEGER,
             compressed_size INTEGER,
             status TEXT,
@@ -275,6 +277,7 @@ def ensure_nhost_table(conn):
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS processed_files (
                 file_path TEXT PRIMARY KEY,
+                file_hash TEXT,
                 original_size BIGINT,
                 compressed_size BIGINT,
                 status TEXT,
@@ -320,23 +323,23 @@ def reconcile_databases():
         only_in_nhost = nhost_paths - local_paths
         
         if only_in_local:
-            local_cursor.execute("SELECT file_path, original_size, compressed_size, status, processed_at FROM processed_files")
+            local_cursor.execute("SELECT file_path, file_hash, original_size, compressed_size, status, processed_at FROM processed_files")
             local_all = {row[0]: row for row in local_cursor.fetchall()}
             push_batch = [local_all[p] for p in only_in_local]
             execute_values(
                 nhost_cursor,
-                "INSERT INTO processed_files (file_path, original_size, compressed_size, status, processed_at) VALUES %s ON CONFLICT (file_path) DO NOTHING",
+                "INSERT INTO processed_files (file_path, file_hash, original_size, compressed_size, status, processed_at) VALUES %s ON CONFLICT (file_path) DO NOTHING",
                 push_batch
             )
             nhost_conn.commit()
             logger.info(f"Pushed {len(push_batch)} missing records to Nhost")
             
         if only_in_nhost:
-            nhost_cursor.execute("SELECT file_path, original_size, compressed_size, status, processed_at FROM processed_files")
+            nhost_cursor.execute("SELECT file_path, file_hash, original_size, compressed_size, status, processed_at FROM processed_files")
             nhost_all = {row[0]: row for row in nhost_cursor.fetchall()}
             pull_batch = [nhost_all[p] for p in only_in_nhost]
             local_cursor.executemany(
-                "INSERT OR REPLACE INTO processed_files (file_path, original_size, compressed_size, status, processed_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO processed_files (file_path, file_hash, original_size, compressed_size, status, processed_at) VALUES (?, ?, ?, ?, ?, ?)",
                 pull_batch
             )
             local_conn.commit()
@@ -398,16 +401,23 @@ def format_size(size_val):
     else:
         return f"{size_val / (1024 * 1024 * 1024):.1f}GB"
 
-def update_file_status(file_key, orig_size, final_size, status):
+def compute_file_hash(filepath):
+    hasher = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(4096 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+def update_file_status(file_key, file_hash, orig_size, final_size, status):
     """Helper to update file status in both local SQLite and Nhost DBs."""
     try:
         conn = sqlite3.connect(LOCAL_DB)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO processed_files 
-            (file_path, original_size, compressed_size, status, processed_at)
-            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (file_key, orig_size, final_size, status))
+            (file_path, file_hash, original_size, compressed_size, status, processed_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """, (file_key, file_hash, orig_size, final_size, status))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -418,14 +428,15 @@ def update_file_status(file_key, orig_size, final_size, status):
         if nhost_conn:
             nhost_cursor = nhost_conn.cursor()
             nhost_cursor.execute("""
-                INSERT INTO processed_files (file_path, original_size, compressed_size, status, processed_at)
-                VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO processed_files (file_path, file_hash, original_size, compressed_size, status, processed_at)
+                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
                 ON CONFLICT (file_path) DO UPDATE SET
+                    file_hash = EXCLUDED.file_hash,
                     original_size = EXCLUDED.original_size,
                     compressed_size = EXCLUDED.compressed_size,
                     status = EXCLUDED.status,
                     processed_at = CURRENT_TIMESTAMP
-            """, (file_key, orig_size, final_size, status))
+            """, (file_key, file_hash, orig_size, final_size, status))
             nhost_conn.commit()
             nhost_conn.close()
     except Exception as e:
@@ -437,12 +448,12 @@ def retry_failed_uploads():
     try:
         conn = sqlite3.connect(LOCAL_DB)
         cursor = conn.cursor()
-        cursor.execute('SELECT file_path, original_size, compressed_size, status FROM processed_files WHERE status = "upload_failed"')
+        cursor.execute('SELECT file_path, file_hash, original_size, compressed_size, status FROM processed_files WHERE status = "upload_failed"')
         rows = cursor.fetchall()
         conn.close()
         
         for row in rows:
-            db_file_path, orig_size, comp_size, status = row
+            db_file_path, file_hash, orig_size, comp_size, status = row
             stats["retried"] += 1
             
             if os.path.isabs(db_file_path):
@@ -467,7 +478,7 @@ def retry_failed_uploads():
             if proc.returncode == 0:
                 stats["recovered"] += 1
                 new_status = "skipped_larger" if orig_size == comp_size else "compressed"
-                update_file_status(db_file_path, orig_size, comp_size, new_status)
+                update_file_status(db_file_path, file_hash, orig_size, comp_size, new_status)
                 logger.info(f"Retry upload succeeded: {full_path}")
             else:
                 stats["still_failed"] += 1
@@ -611,22 +622,25 @@ def main():
 
         conn = sqlite3.connect(LOCAL_DB)
         cursor = conn.cursor()
+        
+        # Fast-Pass: path + size check
         cursor.execute("""
-            SELECT file_path, original_size, compressed_size, status 
+            SELECT file_path, file_hash, original_size, compressed_size, status 
             FROM processed_files 
             WHERE file_path = ? OR file_path LIKE ? OR file_path LIKE ?
         """, (file_key, '%/' + file_key, '%\\' + file_key.replace('/', '\\')))
         row = cursor.fetchone()
-        conn.close()
         
         db_key_to_update = row[0] if row else file_key
+        db_file_hash = row[1] if row else None
         
         retry_upload_only = False
         status = None
+        
         if row:
-            db_orig_size = row[1]
-            db_compressed_size = row[2]
-            db_status = row[3]
+            db_orig_size = row[2]
+            db_compressed_size = row[3]
+            db_status = row[4]
             
             if db_status == "upload_failed":
                 logger.info(f"Retrying upload for previously failed file: {full_path}")
@@ -634,9 +648,40 @@ def main():
                 orig_size = db_orig_size
                 final_size = db_compressed_size
                 status = "skipped_larger" if db_orig_size == db_compressed_size else "compressed"
-            elif orig_size == db_compressed_size:
+            elif orig_size == db_compressed_size or orig_size == db_orig_size:
+                # Fast-pass success: Size matches what we expect from DB, no hashing needed!
                 skipped_count += 1
+                conn.close()
                 continue
+        else:
+            # Deep-Check: File not found by path. Hash it and see if it's renamed/moved
+            logger.info(f"Unrecognized path {file_name}. Computing hash...")
+            db_file_hash = compute_file_hash(full_path)
+            
+            cursor.execute("""
+                SELECT original_size, compressed_size, status 
+                FROM processed_files 
+                WHERE file_hash = ?
+            """, (db_file_hash,))
+            hash_row = cursor.fetchone()
+            
+            if hash_row:
+                # Cache hit on hash! The file was moved/renamed.
+                logger.info(f"File {file_name} matches known hash (moved/renamed). Cloning history.")
+                db_orig_size = hash_row[0]
+                db_compressed_size = hash_row[1]
+                db_status = hash_row[2]
+                
+                # We can safely skip ghostscript entirely, but still trigger an upload
+                retry_upload_only = True
+                orig_size = db_orig_size
+                final_size = db_compressed_size
+                status = "skipped_larger" if db_orig_size == db_compressed_size else "compressed"
+                
+                # Clone history immediately
+                update_file_status(file_key, db_file_hash, orig_size, final_size, status)
+                
+        conn.close()
             
         logger.info(f"Processing {file_name}...")
         temp_path = full_path[:-4] + TEMP_SUFFIX
@@ -660,15 +705,20 @@ def main():
                     os.rename(temp_path, full_path)
                     final_size = new_size
                     status = "compressed"
+                    # After compressing, the file on disk has changed. Compute new hash for the DB.
+                    db_file_hash = compute_file_hash(full_path)
                 else:
                     # Compressed file larger or equal; keep original
                     logger.info(f"Compression did not reduce size. Keeping original: {format_size(orig_size)}")
                     os.remove(temp_path)
                     final_size = orig_size
                     status = "skipped_larger"
+                    # The file on disk didn't change, we can use the hash we already computed (or compute if missing)
+                    if not db_file_hash:
+                        db_file_hash = compute_file_hash(full_path)
                     
                 # d & e. Write to both DBs immediately after compression
-                update_file_status(db_key_to_update, orig_size, final_size, status)
+                update_file_status(db_key_to_update, db_file_hash, orig_size, final_size, status)
 
                 if status == "compressed":
                     run_stats["files_compressed"] += 1
@@ -698,7 +748,7 @@ def main():
             if proc.returncode != 0:
                 error_msg = proc.stderr.strip() or 'Unknown error'
                 # h. If rclone fails: update status to upload_failed in DBs, log error, continue
-                update_file_status(db_key_to_update, orig_size, final_size, "upload_failed")
+                update_file_status(db_key_to_update, db_file_hash, orig_size, final_size, "upload_failed")
                 logger.error(f"rclone upload failed for {full_path}. stderr: {error_msg}")
                 error_count += 1
                 run_stats["files_upload_failed"] += 1
@@ -706,7 +756,7 @@ def main():
                 
             # g. If rclone succeeds: no DB change needed unless we were retrying
             if retry_upload_only:
-                update_file_status(db_key_to_update, orig_size, final_size, status)
+                update_file_status(db_key_to_update, db_file_hash, orig_size, final_size, status)
                 
             logger.info(f"Upload successful for {file_name}")
             uploaded_files.append((file_name, orig_size, final_size, reduction_pct))

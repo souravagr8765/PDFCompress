@@ -5,3 +5,4 @@ __pycache__
 local_cache.db
 Temp
 .vscode
+migrate_db.py
