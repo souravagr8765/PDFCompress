@@ -34,9 +34,9 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # --- Paths & Local Storage ---
 WATCH_FOLDER = os.getenv("WATCH_FOLDER", "")
-LOCAL_DB = os.getenv("LOCAL_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_cache.db"))
+LOCAL_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.getenv("LOCAL_DB", "local_cache.db"))
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".pdf_sync.lock")
-LOG_FILE = os.getenv("LOG_FILE", "./compressor.log")
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.getenv("LOG_FILE", "compressor.log"))
 TEMP_SUFFIX = "_compressed_tmp.pdf"
 
 # --- Ghostscript Settings ---
@@ -536,7 +536,7 @@ def main():
     #     start_pos = os.path.getsize(LOG_FILE)
 
     # logger.info("Starting PDF Sync Script")
-    # init_local_db()
+    init_local_db()
     
     # # Start Loki Logger if environment variables are set
     # loki_url = os.environ.get("LOKI_URL")
