@@ -9,7 +9,7 @@ This project is an automation script (`pdf_sync.py`) designed to monitor a speci
 
 # Database Schema
 The script uses a local SQLite database (`local_cache.db`) to track the state of processed files, which is also synchronized with a remote Nhost PostgreSQL database for state consistency.
-- **Table `processed_files`**: Stores `file_path` (PRIMARY KEY), `original_size`, `compressed_size`, `status` (`compressed`, `skipped_larger`, or `upload_failed`), and `processed_at` timestamp. This prevents infinite loops, redundant recompression tasks, gracefully handles interrupted or failed uploads, and ensures files modified after compression are correctly re-evaluated. Both local SQLite and Nhost PostgreSQL maintain this same schema.
+- **Table `processed_files`**: Stores `file_path` (PRIMARY KEY, uses cross-platform relative paths for seamless Termux/Windows sync while falling back to absolute where historically used), `original_size`, `compressed_size`, `status` (`compressed`, `skipped_larger`, or `upload_failed`), and `processed_at` timestamp. This prevents infinite loops, redundant recompression tasks, gracefully handles interrupted or failed uploads, and ensures files modified after compression are correctly re-evaluated. Both local SQLite and Nhost PostgreSQL maintain this same schema.
 
 # Environment Configuration
 Configuration is currently declared statically within the script body, simplifying the single-file portability.

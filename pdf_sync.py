@@ -398,7 +398,7 @@ def format_size(size_val):
     else:
         return f"{size_val / (1024 * 1024 * 1024):.1f}GB"
 
-def update_file_status(full_path, orig_size, final_size, status):
+def update_file_status(file_key, orig_size, final_size, status):
     """Helper to update file status in both local SQLite and Nhost DBs."""
     try:
         conn = sqlite3.connect(LOCAL_DB)
@@ -407,11 +407,11 @@ def update_file_status(full_path, orig_size, final_size, status):
             INSERT OR REPLACE INTO processed_files 
             (file_path, original_size, compressed_size, status, processed_at)
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        """, (full_path, orig_size, final_size, status))
+        """, (file_key, orig_size, final_size, status))
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Failed to update local DB status for {full_path}: {e}")
+        logger.error(f"Failed to update local DB status for {file_key}: {e}")
 
     try:
         nhost_conn = get_nhost_conn()
@@ -425,11 +425,11 @@ def update_file_status(full_path, orig_size, final_size, status):
                     compressed_size = EXCLUDED.compressed_size,
                     status = EXCLUDED.status,
                     processed_at = CURRENT_TIMESTAMP
-            """, (full_path, orig_size, final_size, status))
+            """, (file_key, orig_size, final_size, status))
             nhost_conn.commit()
             nhost_conn.close()
     except Exception as e:
-        logger.warning(f"Failed to sync record {os.path.basename(full_path)} to Nhost: {e}")
+        logger.warning(f"Failed to sync record {os.path.basename(file_key)} to Nhost: {e}")
 
 def retry_failed_uploads():
     """Dedicated retry pass for uploads that failed."""
@@ -442,9 +442,14 @@ def retry_failed_uploads():
         conn.close()
         
         for row in rows:
-            full_path, orig_size, comp_size, status = row
+            db_file_path, orig_size, comp_size, status = row
             stats["retried"] += 1
             
+            if os.path.isabs(db_file_path):
+                full_path = db_file_path
+            else:
+                full_path = os.path.abspath(os.path.join(WATCH_FOLDER, db_file_path))
+                
             if not os.path.exists(full_path):
                 logger.warning(f"Failed upload file missing locally, cannot retry: {full_path}")
                 stats["still_failed"] += 1
@@ -462,7 +467,7 @@ def retry_failed_uploads():
             if proc.returncode == 0:
                 stats["recovered"] += 1
                 new_status = "skipped_larger" if orig_size == comp_size else "compressed"
-                update_file_status(full_path, orig_size, comp_size, new_status)
+                update_file_status(db_file_path, orig_size, comp_size, new_status)
                 logger.info(f"Retry upload succeeded: {full_path}")
             else:
                 stats["still_failed"] += 1
@@ -602,11 +607,19 @@ def main():
             continue
         orig_size = os.path.getsize(full_path)
         
+        file_key = os.path.relpath(full_path, WATCH_FOLDER).replace("\\", "/")
+
         conn = sqlite3.connect(LOCAL_DB)
         cursor = conn.cursor()
-        cursor.execute("SELECT file_path, original_size, compressed_size, status FROM processed_files WHERE file_path = ?", (full_path,))
+        cursor.execute("""
+            SELECT file_path, original_size, compressed_size, status 
+            FROM processed_files 
+            WHERE file_path = ? OR file_path LIKE ? OR file_path LIKE ?
+        """, (file_key, '%/' + file_key, '%\\' + file_key.replace('/', '\\')))
         row = cursor.fetchone()
         conn.close()
+        
+        db_key_to_update = row[0] if row else file_key
         
         retry_upload_only = False
         status = None
@@ -655,7 +668,7 @@ def main():
                     status = "skipped_larger"
                     
                 # d & e. Write to both DBs immediately after compression
-                update_file_status(full_path, orig_size, final_size, status)
+                update_file_status(db_key_to_update, orig_size, final_size, status)
 
                 if status == "compressed":
                     run_stats["files_compressed"] += 1
@@ -685,7 +698,7 @@ def main():
             if proc.returncode != 0:
                 error_msg = proc.stderr.strip() or 'Unknown error'
                 # h. If rclone fails: update status to upload_failed in DBs, log error, continue
-                update_file_status(full_path, orig_size, final_size, "upload_failed")
+                update_file_status(db_key_to_update, orig_size, final_size, "upload_failed")
                 logger.error(f"rclone upload failed for {full_path}. stderr: {error_msg}")
                 error_count += 1
                 run_stats["files_upload_failed"] += 1
@@ -693,7 +706,7 @@ def main():
                 
             # g. If rclone succeeds: no DB change needed unless we were retrying
             if retry_upload_only:
-                update_file_status(full_path, orig_size, final_size, status)
+                update_file_status(db_key_to_update, orig_size, final_size, status)
                 
             logger.info(f"Upload successful for {file_name}")
             uploaded_files.append((file_name, orig_size, final_size, reduction_pct))
